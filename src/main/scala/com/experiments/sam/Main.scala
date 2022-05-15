@@ -1,11 +1,10 @@
 package com.experiments.sam
 
-import java.time.LocalDateTime
-
-import cats.Monad
 import cats.effect.kernel.{Async, Sync}
 import cats.effect.{IO, IOApp}
+import cats.syntax.all._
 import com.comcast.ip4s._
+import com.experiments.sam.Kafka._
 import fs2.Stream
 import fs2.kafka._
 import io.circe.syntax._
@@ -15,18 +14,20 @@ import org.http4s.ember.server._
 import org.http4s.implicits._
 import org.http4s.server.Server
 
-import Kafka._
+import java.time.LocalDateTime
+import java.util.UUID
 object Main extends IOApp.Simple {
 
   override def run: IO[Unit] = {
-    val program = for {
-      resources <- AppResources.make[IO]
-      producer  <- KafkaProducer.stream(resources.kafka)
-      kafka     <- Stream(Kafka.make(producer))
-      server    <- MkHttpServer[IO].make(kafka)
-    } yield server
+    val config = AppResources.make[IO]
+    val program: Stream[IO, Server] =
+      for {
+        producer <- KafkaProducer.stream(config.kafka)
+        kafka    <- Stream(Kafka.make(producer))
+        server   <- MkHttpServer[IO].make(kafka).evalTap(_ => IO.never)
+      } yield server
 
-    program.compile.resource.lastOrError.useForever
+    program.compile.drain
   }
 }
 
@@ -58,17 +59,16 @@ sealed abstract case class AppResources[F[_]] private (
 )
 
 object AppResources {
-  def make[F[_]: Async]: Stream[F, AppResources[F]] = {
-    def makeKafka(config: KafkaConfig): Stream[F, ProducerSettings[F, String, Message]] = Stream(
+  def make[F[_]: Async]: AppResources[F] = {
+    def makeKafka(config: KafkaConfig): ProducerSettings[F, String, Message] =
       ProducerSettings(
         keySerializer = Serializer[F, String],
         valueSerializer = Serializer.instance[F, Message] { (_, _, kafkaReq) =>
           Sync[F].delay(kafkaReq.data.asJson.toString().getBytes("UTF-8"))
         }
       ).withBootstrapServers(config.brokers)
-    ).covary[F]
 
-    makeKafka(KafkaConfig("localhost:9092", "topic")).map(new AppResources(_) {})
+    new AppResources[F](makeKafka(KafkaConfig("localhost:9092", "topic"))) {}
   }
 }
 
@@ -78,23 +78,29 @@ trait MkHttpServer[F[_]] {
 object MkHttpServer {
 
   // Routes
-  final case class Routes[F[_]: Monad](kafka: Kafka[F]) extends Http4sDsl[F] {
+  final case class Routes[F[_]: Sync](kafka: Kafka[F]) extends Http4sDsl[F] {
+    private val genUUID: F[UUID] = Sync[F].delay(UUID.randomUUID())
+
+    private def mkMessage(id: UUID) =
+      Message(
+        Map(
+          "uuid"    -> id.toString,
+          "name"    -> "Samuel",
+          "surname" -> "Gomez",
+          "email"   -> "samgomjim.18@gmail.com",
+          "source"  -> "http4s"
+        )
+      )
+
     private val httpRoutes: HttpRoutes[F] = HttpRoutes.of[F] { case GET -> Root =>
-      /* kafka.publish(
-        Message(
-          Map(
-            "uuid"    -> UUID.randomUUID().toString,
-            "name"    -> "Samuel",
-            "surname" -> "Gomez",
-            "email"   -> "samgomjim.18@gmail.com",
-            "source"  -> "http4s"
-          )
-        ),
-        "topic"
-      ) */
-      Ok("Hello, world!")
+      for {
+        id       <- genUUID
+        _        <- kafka.publish(mkMessage(id), "topic")
+        response <- Ok(id.toString)
+      } yield response
     }
-    val routes = httpRoutes
+
+    val routes: HttpRoutes[F] = httpRoutes
   }
 
   def apply[F[_]: MkHttpServer]: MkHttpServer[F] = implicitly[MkHttpServer[F]]
