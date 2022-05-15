@@ -1,14 +1,10 @@
 package com.experiments.sam
 
 import java.time.LocalDateTime
-import java.util.UUID
-
-import scala.concurrent.duration._
 
 import cats.Monad
 import cats.effect.kernel.{Async, Sync}
 import cats.effect.{IO, IOApp}
-import cats.syntax.all._
 import com.comcast.ip4s._
 import fs2.Stream
 import fs2.kafka._
@@ -22,46 +18,16 @@ import org.http4s.server.Server
 import Kafka._
 object Main extends IOApp.Simple {
 
-  override def run: IO[Unit] =
-    AppResources
-      .make[IO]
-      .flatMap { settings =>
-        Stream(
-          KafkaProducer
-            .stream(settings.kafka) -> Stream.emit(settings.server)
-        )
-      }
-      .flatMap { case (kafka, server) =>
-        Stream(
-          server,
-          kafka.flatMap { producer =>
-            val kafka = Kafka
-              .make(producer)
-            val messages = Stream(
-              Message(
-                Map(
-                  "uuid"    -> UUID.randomUUID().toString,
-                  "name"    -> "Samuel",
-                  "surname" -> "Gomez",
-                  "email"   -> "samgomjim.18@gmail.com"
-                )
-              )
-            ).repeatN(35)
+  override def run: IO[Unit] = {
+    val program = for {
+      resources <- AppResources.make[IO]
+      producer  <- KafkaProducer.stream(resources.kafka)
+      kafka     <- Stream(Kafka.make(producer))
+      server    <- MkHttpServer[IO].make(kafka)
+    } yield server
 
-            messages
-              .evalMap(msg => kafka.publish(msg, "topic"))
-              .groupWithin(512, 5.seconds)
-              .evalMap(_.sequence)
-              .unchunks
-              .evalTap(e => IO.println(s"published $e"))
-              .void
-          }
-        ).parJoinUnbounded
-      }
-      .compile
-      .resource
-      .lastOrError
-      .useForever
+    program.compile.resource.lastOrError.useForever
+  }
 }
 
 trait Kafka[F[_]] {
@@ -88,8 +54,7 @@ object Kafka {
 }
 
 sealed abstract case class AppResources[F[_]] private (
-  val kafka: KafkaService[F],
-  val server: Server
+  val kafka: KafkaService[F]
 )
 
 object AppResources {
@@ -103,19 +68,31 @@ object AppResources {
       ).withBootstrapServers(config.brokers)
     ).covary[F]
 
-    (makeKafka(KafkaConfig("localhost:9092", "topic")), MkHttpServer[F].make).mapN(new AppResources(_, _) {})
+    makeKafka(KafkaConfig("localhost:9092", "topic")).map(new AppResources(_) {})
   }
 }
 
 trait MkHttpServer[F[_]] {
-  def make: Stream[F, Server]
+  def make(kafka: Kafka[F]): Stream[F, Server]
 }
 object MkHttpServer {
 
   // Routes
-  final case class Routes[F[_]: Monad]() extends Http4sDsl[F] {
+  final case class Routes[F[_]: Monad](kafka: Kafka[F]) extends Http4sDsl[F] {
     private val httpRoutes: HttpRoutes[F] = HttpRoutes.of[F] { case GET -> Root =>
-      Ok("brands.findAll")
+      /* kafka.publish(
+        Message(
+          Map(
+            "uuid"    -> UUID.randomUUID().toString,
+            "name"    -> "Samuel",
+            "surname" -> "Gomez",
+            "email"   -> "samgomjim.18@gmail.com",
+            "source"  -> "http4s"
+          )
+        ),
+        "topic"
+      ) */
+      Ok("Hello, world!")
     }
     val routes = httpRoutes
   }
@@ -123,14 +100,14 @@ object MkHttpServer {
   def apply[F[_]: MkHttpServer]: MkHttpServer[F] = implicitly[MkHttpServer[F]]
 
   implicit def forAsync[F[_]: Async]: MkHttpServer[F] = new MkHttpServer[F] {
-    override def make: Stream[F, Server] =
+    override def make(kafka: Kafka[F]): Stream[F, Server] =
       Stream
         .resource(
           EmberServerBuilder
             .default[F]
             .withHost(host"0.0.0.0")
             .withPort(port"8080")
-            .withHttpApp(Routes[F].routes.orNotFound)
+            .withHttpApp(Routes[F](kafka).routes.orNotFound)
             .build
         )
   }
