@@ -2,6 +2,7 @@ version: "3.9"
 
 services:
     kafka:
+        restart: always
         image: ubuntu/kafka
         entrypoint: >
             bash -c "export CLUSTER_ID=$$(/opt/kafka/bin/kafka-storage.sh random-uuid) &&
